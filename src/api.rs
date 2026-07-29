@@ -267,6 +267,10 @@ pub struct PushOptions {
     pub url: String,
     pub key: String,
     pub no_record: bool,
+    /// Install deliberately malicious registration/assets for an authorized
+    /// XSS regression test. Never enable against a hub you do not own.
+    #[doc(hidden)]
+    pub xss_test: bool,
 }
 
 #[cfg(feature = "push-api")]
@@ -276,6 +280,7 @@ impl PushOptions {
             url: url.into(),
             key: key.into(),
             no_record: false,
+            xss_test: false,
         }
     }
 }
@@ -297,6 +302,7 @@ where
         presentation.fonts,
         presentation.template,
         options.no_record,
+        options.xss_test,
         start,
     )
     .await

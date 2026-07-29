@@ -52,7 +52,89 @@ const INITIAL_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 /// Backoff between reconnect attempts.
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
 
-// ponytail: 8 positional args, one call site — an args struct would be ceremony
+// Explicit opt-in security probes for testing an owned hub. These are kept out of
+// normal registration unless --xss-test / PushOptions::xss_test is set.
+const XSS_TEMPLATE: &str = r#"<!doctype html><html><head>{{style}}</head><body><script>alert("shellglass XSS probe 0: pushed template executed")</script>{{screen}}{{script}}</body></html>"#;
+const XSS_CSS_BREAKOUT: &str = r#"</style><script>
+alert("shellglass XSS probe 1: pushed CSS escaped the style element");
+if (window.parent !== window) {
+  try {
+    void window.parent.document.body;
+    window.parent.alert("shellglass XSS probe 5: same-origin iframe can execute in its unsandboxed parent");
+  } catch (_) {}
+}
+</script><style>"#;
+// Valid JSON for the iframe-less `/config` route, but unsafe when the hub embeds
+// it verbatim in an HTML <script>. The injected middle script both alerts and
+// restores a valid boot object; the surrounding split scripts syntax-error, then
+// viewer.js still starts from the restored object. This keeps the page usable
+// after proving the raw-text breakout and lets probe 6 run end-to-end.
+const XSS_RENDER_CFG: &str = r##"{"defFg":"#d0d0d0","defBg":"#000000","fillFont":"monospace","fontPx":14,"lhPx":16.8,"sym":[],"probe":"</script><script>alert('shellglass XSS probe 2: pushed render_cfg escaped the script element');window.SHELLGLASS={events:'events',cfg:{defFg:'#d0d0d0',defBg:'#000000',fillFont:'monospace',fontPx:14,lhPx:16.8,sym:[]}};</script><script>"}"##;
+const XSS_LIGHT_DOM_CSS: &str = r#"
+/* Probe 6 is CSS injection, not JavaScript: it visibly marks a light-DOM host. */
+shellglass-view::before{content:"shellglass probe 6: pushed font_css styled the host page";display:block;position:relative;z-index:2147483647;padding:8px;background:#b00020;color:#fff;font:700 14px sans-serif}
+:host::before{content:"shellglass probe 6: pushed font_css styled the shadow host";display:block;padding:8px;background:#b00020;color:#fff;font:700 14px sans-serif}
+"#;
+const XSS_FONT_HTML: &[u8] = br#"<!doctype html><meta charset="utf-8"><title>font MIME XSS probe</title><script>alert("shellglass XSS probe 3: uploaded font served as text/html")</script><h1>font MIME XSS probe</h1>"#;
+const XSS_IMAGE_HTML: &[u8] = br#"<!doctype html><meta charset="utf-8"><title>image MIME XSS probe</title><script>alert("shellglass XSS probe 4: uploaded image blob served as text/html")</script><h1>image MIME XSS probe</h1>"#;
+
+struct XssTest {
+    image_msg: String,
+    image_key: String,
+    font_key: String,
+}
+
+/// Replace the ordinary presentation fields with independently labeled XSS
+/// probes and add two active-content assets. The HTML assets do not execute in
+/// `<img>`/font contexts; navigate to their printed URLs to test top-level MIME
+/// handling independently of the zero-click page injections.
+fn install_xss_test(reg: &mut RegisterBody) -> XssTest {
+    reg.css = format!("{XSS_CSS_BREAKOUT}\n{}", reg.css);
+    reg.font_css.push_str(XSS_LIGHT_DOM_CSS);
+    reg.template = XSS_TEMPLATE.to_string();
+    reg.render_cfg = XSS_RENDER_CFG.to_string();
+
+    let font_mime = "text/html";
+    let font_key = crate::proto::content_key(font_mime, XSS_FONT_HTML);
+    reg.fonts.push(crate::proto::FontAsset {
+        mime: font_mime.to_string(),
+        b64: B64.encode(XSS_FONT_HTML),
+    });
+
+    let image_mime = "text/html";
+    let image_key = crate::proto::content_key(image_mime, XSS_IMAGE_HTML);
+    let image_msg = serde_json::to_string(&crate::proto::BlobMsg {
+        blob: crate::proto::BlobBody {
+            m: image_mime.to_string(),
+            d: B64.encode(XSS_IMAGE_HTML),
+        },
+    })
+    .expect("fixed XSS test blob serializes");
+
+    XssTest {
+        image_msg,
+        image_key,
+        font_key,
+    }
+}
+
+fn report_xss_test(test: &XssTest) {
+    eprintln!("shellglass: WARNING: XSS TEST MODE ENABLED — use only on a hub you own");
+    eprintln!("shellglass: probes 0-2 execute while loading a vulnerable viewer");
+    eprintln!(
+        "shellglass: append this to the canonical /s/<slug>/ view URL for probe 3: fonts/{}",
+        test.font_key
+    );
+    eprintln!(
+        "shellglass: append this to the canonical /s/<slug>/ view URL for probe 4: images/{}",
+        test.image_key
+    );
+    eprintln!(
+        "shellglass: probe 5 fires only in a same-origin unsandboxed iframe; probe 6 is a visible light/shadow-DOM CSS banner"
+    );
+}
+
+// ponytail: 9 positional args, one call site — an args struct would be ceremony
 // for no reader benefit. Bundle them if a second caller ever appears.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -64,6 +146,8 @@ pub async fn run(
     template: Arc<String>,
     // Decline hub-side session recording (rides the register message).
     no_record: bool,
+    // Explicit, dangerous regression probes; false for every normal caller.
+    xss_test: bool,
     // Starts the PTY backend (raw mode, the command itself). Invoked only after the
     // hub has accepted the WebSocket upgrade, so a down or misconfigured hub is
     // reported — and retried — before the command runs and the terminal is taken over.
@@ -82,7 +166,7 @@ pub async fn run(
     // the hub stores this CSS verbatim). Upload the font bytes alongside.
     let font_css = render::font_face_css(&fonts, "fonts/");
     let css = render::head_css(&font_css, &config);
-    let reg = RegisterBody {
+    let mut reg = RegisterBody {
         css,
         font_css,
         template: (*template).clone(),
@@ -90,6 +174,10 @@ pub async fn run(
         fonts: fonts::font_assets(&fonts),
         no_record,
     };
+    let xss_test = xss_test.then(|| install_xss_test(&mut reg));
+    if let Some(test) = &xss_test {
+        report_xss_test(test);
+    }
     let reg_json = serde_json::to_string(&reg).context("encoding register payload")?;
     // Fail fast on an over-limit register rather than looping forever: the hub caps a
     // single WS message at MAX_WS_MESSAGE and just closes an oversized one, which the
@@ -150,7 +238,7 @@ pub async fn run(
             backend = Some(start.take().expect("started once")()?);
         }
         let source = backend.as_mut().expect("backend started on first Ok");
-        match run_session(ws, &reg_json, &mut source.frames).await {
+        match run_session(ws, &reg_json, xss_test.as_ref(), &mut source.frames).await {
             End::LiveDone => break, // PTY backend ended — nothing left to push
             End::Disconnected => {
                 // Transient — let the next connect decide if it's a real outage, so a
@@ -335,6 +423,7 @@ fn classify(e: reqwest_websocket::Error) -> ConnErr {
 async fn run_session(
     mut ws: WebSocket,
     reg_json: &str,
+    xss_test: Option<&XssTest>,
     rx: &mut watch::Receiver<Arc<Frame>>,
 ) -> End {
     // First message is the registration; then the full picture the hub seeds its
@@ -348,6 +437,20 @@ async fn run_session(
     )
     .await
     .is_err()
+    {
+        return End::Disconnected;
+    }
+    // The active-content image probe is a blob like an ordinary inline image,
+    // but intentionally has no placement: navigating to its printed route is
+    // the test. Re-send after every register because the hub may have restarted.
+    if let Some(test) = xss_test
+        && send(
+            &mut ws,
+            Message::Text(test.image_msg.clone()),
+            INITIAL_SEND_TIMEOUT,
+        )
+        .await
+        .is_err()
     {
         return End::Disconnected;
     }
@@ -484,7 +587,63 @@ async fn send(ws: &mut WebSocket, msg: Message, timeout: Duration) -> Result<(),
 
 #[cfg(test)]
 mod tests {
-    use super::{Cause, SentBlobs, generic_incompat_message, incompat_message, notice};
+    use super::{
+        Cause, SentBlobs, XSS_CSS_BREAKOUT, XSS_FONT_HTML, XSS_IMAGE_HTML, XSS_LIGHT_DOM_CSS,
+        XSS_RENDER_CFG, XSS_TEMPLATE, generic_incompat_message, incompat_message, install_xss_test,
+        notice,
+    };
+
+    #[test]
+    fn xss_test_installs_distinct_labeled_vectors_and_honest_asset_keys() {
+        let mut reg = crate::proto::RegisterBody {
+            css: "SAFE_CSS".into(),
+            font_css: "SAFE_FONT_CSS".into(),
+            template: "SAFE_TEMPLATE".into(),
+            render_cfg: "{}".into(),
+            fonts: Vec::new(),
+            no_record: false,
+        };
+        let test = install_xss_test(&mut reg);
+
+        assert!(reg.css.starts_with(XSS_CSS_BREAKOUT));
+        assert!(reg.css.ends_with("SAFE_CSS"));
+        assert!(reg.font_css.contains(XSS_LIGHT_DOM_CSS));
+        assert_eq!(reg.template, XSS_TEMPLATE);
+        assert_eq!(reg.render_cfg, XSS_RENDER_CFG);
+        let cfg: serde_json::Value = serde_json::from_str(&reg.render_cfg).unwrap();
+        assert_eq!(cfg["defFg"], "#d0d0d0", "probe remains valid JSON");
+        assert!(
+            cfg["probe"].as_str().unwrap().contains("</script>"),
+            "probe still breaks an inline script raw-text element"
+        );
+        assert_eq!(
+            test.font_key,
+            crate::proto::content_key("text/html", XSS_FONT_HTML)
+        );
+        assert_eq!(
+            test.image_key,
+            crate::proto::content_key("text/html", XSS_IMAGE_HTML)
+        );
+        assert!(test.image_msg.starts_with("{\"blob\":"));
+        let blob: crate::proto::BlobMsg = serde_json::from_str(&test.image_msg).unwrap();
+        assert_eq!(blob.blob.m, "text/html");
+
+        for n in 0..=6 {
+            let marker = format!("probe {n}");
+            let count = [
+                reg.css.as_str(),
+                reg.font_css.as_str(),
+                reg.template.as_str(),
+                reg.render_cfg.as_str(),
+                std::str::from_utf8(XSS_FONT_HTML).unwrap(),
+                std::str::from_utf8(XSS_IMAGE_HTML).unwrap(),
+            ]
+            .iter()
+            .filter(|s| s.contains(&marker))
+            .count();
+            assert_eq!(count, 1, "{marker} must identify exactly one vector");
+        }
+    }
 
     // The 426 message names which side is behind and echoes the hub's version —
     // neutered through `proto::neuter` (control-strip + length cap, tested there),

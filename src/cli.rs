@@ -427,6 +427,12 @@ pub struct PushArgs {
     )]
     no_record: bool,
 
+    /// DANGEROUS: send labeled XSS regression probes to a hub you own. This
+    /// deliberately executes alerts in vulnerable viewers and publishes two
+    /// same-origin HTML asset URLs. Hidden because it is only a security-test aid.
+    #[arg(long, hide = true)]
+    xss_test: bool,
+
     /// Run detached (dtach-style): the command runs in a terminal-less PTY, keeps
     /// streaming to the hub with no local terminal, and is reachable via
     /// `shellglass attach`. Detach a client with `Ctrl-\`; the session then holds
@@ -825,6 +831,7 @@ impl PushArgs {
         }
         let mut options = crate::api::PushOptions::new(self.url, self.key.key);
         options.no_record = self.no_record;
+        options.xss_test = self.xss_test;
         let source: SourceFactory = {
             #[cfg(unix)]
             if let Some((cmd, sock, size)) = detached {
