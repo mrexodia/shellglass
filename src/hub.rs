@@ -1502,6 +1502,10 @@ async fn push_session(st: HubState, id: String, base: String, mut socket: WebSoc
     let mut live: Option<Arc<diff::Live>> = None;
     // The session's kick channel (management-API delete), armed at register.
     let mut kick: Option<broadcast::Receiver<()>> = None;
+    // This connection's generation (`diff::Live::begin_generation`), armed at
+    // register — guards the cleanup below against clobbering a reconnect that has
+    // already superseded this connection (see `end_generation`).
+    let mut generation: Option<u64> = None;
     // Session recording (`--record-dir`, declinable in the client's register):
     // armed at register, then fed every Text message VERBATIM — the recording
     // is the timestamped push transcript itself (register, blobs, wire), no
@@ -1570,9 +1574,10 @@ async fn push_session(st: HubState, id: String, base: String, mut socket: WebSoc
                             Ok(reg) => {
                                 let no_record = reg.no_record;
                                 match register_session(&st, &id, &base, reg) {
-                                Some((l, k)) => {
+                                Some((l, k, g)) => {
                                     live = Some(l);
                                     kick = Some(k);
+                                    generation = Some(g);
                                     if !no_record && let Some(dir) = &st.record_dir {
                                         let (rec, done) = crate::record::start(dir.join(&id));
                                         rec.event(t.as_str()); // the register, verbatim
@@ -1642,11 +1647,13 @@ async fn push_session(st: HubState, id: String, base: String, mut socket: WebSoc
     // Pusher gone (drop, error, or shutdown): flag the operator offline so viewers
     // see the session is no longer live. The session + last frame are kept, so the
     // frozen screen stays up. `None` = died before registering; nothing to flag.
-    // ponytail: last-writer-wins if two pushers share one id — the rarer one exiting
-    // marks the session offline while the other still streams. Single-pusher is the
-    // norm; add a refcount if concurrent pushers become real.
-    if let Some(l) = &live {
-        l.set_online(false);
+    // `end_generation` only applies if a reconnect hasn't already superseded this
+    // connection (see its doc comment) — otherwise this is a stale, delayed
+    // teardown (e.g. a one-way network blackhole the outer proxy took a while to
+    // reap) racing behind an already-registered, healthy reconnect, and must not
+    // clobber its online state.
+    if let (Some(l), Some(g)) = (&live, generation) {
+        l.end_generation(g);
     }
 }
 
@@ -1689,18 +1696,19 @@ fn store_blob(st: &HubState, id: &str, live: &diff::Live, msg: &str) {
 }
 
 /// Create or refresh the session for `id` from a register message; returns its
-/// `Live` plus a receiver for the session's kick channel (fired when the
-/// management API deletes the session). New sessions get a "waiting…" screen
-/// (replaced by the first pushed frame) and announce their view URL once —
-/// reconnects hit the refresh branch, so no spam. `None` = the session was
-/// deleted between the upgrade's authorize and this register (the API raced
-/// the connect); the caller closes.
+/// `Live`, a receiver for the session's kick channel (fired when the management
+/// API deletes the session), and this connection's `diff::Live` generation (see
+/// `Live::begin_generation` — the caller must pass it to `end_generation` on
+/// exit). New sessions get a "waiting…" screen (replaced by the first pushed
+/// frame) and announce their view URL once — reconnects hit the refresh
+/// branch, so no spam. `None` = the session was deleted between the upgrade's
+/// authorize and this register (the API raced the connect); the caller closes.
 fn register_session(
     st: &HubState,
     id: &str,
     base: &str,
     reg: proto::RegisterBody,
-) -> Option<(Arc<diff::Live>, broadcast::Receiver<()>)> {
+) -> Option<(Arc<diff::Live>, broadcast::Receiver<()>, u64)> {
     // Decode first, then establish family identities from valid regular faces.
     // A regular face owns only its own hub-derived content key; a bold face can
     // reference that key only when the regular was uploaded in this registration.
@@ -1806,9 +1814,10 @@ fn register_session(
             println!("shellglass: session connected — view at {base}/s/{slug}/");
         }
         // Coming (back) online — new stubs start offline, dropped pushers were
-        // marked offline by push_session.
-        s.live.set_online(true);
-        Some((Arc::clone(&s.live), s.kick.subscribe()))
+        // marked offline by push_session. Also stakes this connection's generation,
+        // so a still-unwinding prior connection's delayed teardown can't clobber it.
+        let generation = s.live.begin_generation();
+        Some((Arc::clone(&s.live), s.kick.subscribe(), generation))
     } else {
         // Fallback only: an authorized id always has a stub, but keep the
         // create path for the theoretical gap.
@@ -1839,7 +1848,9 @@ fn register_session(
             },
         );
         println!("shellglass: session connected — view at {base}/s/{slug}/");
-        Some((live, kick_rx))
+        // Stake this connection's generation (see the other branch's comment).
+        let generation = live.begin_generation();
+        Some((live, kick_rx, generation))
     }
 }
 
@@ -2554,7 +2565,7 @@ mod tests {
             parse_allow(&[format!("{a}:one"), format!("{b}:two")]).unwrap(),
             "http://h".into(),
         );
-        let (live_a, _k) = register_session(&st, &a, "http://h", reg("x")).unwrap();
+        let (live_a, _k, _gen) = register_session(&st, &a, "http://h", reg("x")).unwrap();
         register_session(&st, &b, "http://h", reg("x")).unwrap();
 
         let bytes = b"\x89PNG\r\n\x1a\nPNG-ISH-BYTES";
@@ -2732,7 +2743,7 @@ mod tests {
 
         // First register (the WS's first message) adopts the stub's Live —
         // placeholder viewers already subscribed aren't orphaned.
-        let (live1, _kick1) = register_session(&st, &id, "http://h", reg("a{}")).unwrap();
+        let (live1, _kick1, gen1) = register_session(&st, &id, "http://h", reg("a{}")).unwrap();
         assert!(
             Arc::ptr_eq(&stub, &live1),
             "register must adopt the stub's Live"
@@ -2741,7 +2752,7 @@ mod tests {
 
         // A reconnect re-registers: the CSS refreshes but the same Live is reused, so
         // viewers already subscribed don't get orphaned.
-        let (live2, _kick2) = register_session(&st, &id, "http://h", reg("b{}")).unwrap();
+        let (live2, _kick2, gen2) = register_session(&st, &id, "http://h", reg("b{}")).unwrap();
         assert!(
             Arc::ptr_eq(&live1, &live2),
             "reconnect must reuse the session's Live, not replace it"
@@ -2750,6 +2761,42 @@ mod tests {
             st.sessions.lock().unwrap().get(&id).unwrap().css,
             "b{}",
             "re-register refreshes the pushed CSS"
+        );
+        assert_ne!(gen1, gen2, "a reconnect stakes a new generation");
+    }
+
+    // Regression for the race a stale connection's delayed teardown used to lose to:
+    // a reconnect (e.g. after a one-way network blackhole) registers before the OLD
+    // connection's handler notices it's dead, so the old connection's cleanup must not
+    // flip a healthy, newer connection's `online` back off.
+    #[test]
+    fn stale_connections_end_generation_does_not_clobber_a_reconnect() {
+        let id = session_id("secret");
+        let st = HubState::new(
+            parse_allow(std::slice::from_ref(&id)).unwrap(),
+            "http://h".into(),
+        );
+        let (live1, _kick1, gen1) = register_session(&st, &id, "http://h", reg("a{}")).unwrap();
+        assert!(live1.is_online());
+
+        // The client reconnects (old connection not yet detected as dead hub-side).
+        let (live2, _kick2, gen2) = register_session(&st, &id, "http://h", reg("a{}")).unwrap();
+        assert!(Arc::ptr_eq(&live1, &live2));
+        assert!(live2.is_online());
+
+        // The OLD connection's handler finally unwinds (delayed error/close) and runs
+        // its cleanup — this must be a no-op now that a reconnect has superseded it.
+        live1.end_generation(gen1);
+        assert!(
+            live2.is_online(),
+            "a superseded connection's teardown must not mark the operator offline"
+        );
+
+        // The CURRENT connection's own teardown still works.
+        live2.end_generation(gen2);
+        assert!(
+            !live2.is_online(),
+            "the current connection's teardown does mark the operator offline"
         );
     }
 
@@ -2760,7 +2807,7 @@ mod tests {
             parse_allow(&[format!("{id}:one")]).unwrap(),
             "http://h".into(),
         );
-        let (live, _kick) = register_session(&st, &id, "http://h", reg("a{}")).unwrap();
+        let (live, _kick, _gen) = register_session(&st, &id, "http://h", reg("a{}")).unwrap();
         let want = live.snapshot().to_string();
 
         let router = app(st);

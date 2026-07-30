@@ -64,7 +64,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(any(feature = "serve-api", feature = "hub"))]
 use std::convert::Infallible;
 #[cfg(any(feature = "serve-api", feature = "hub"))]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::{broadcast, watch};
 #[cfg(any(feature = "serve-api", feature = "hub"))]
@@ -138,6 +139,14 @@ pub struct Live {
     /// operator IS the process, and its death drops the SSE stream instead. A `watch`
     /// so a viewer connecting mid-outage reads the current value, not just changes.
     online: watch::Sender<bool>,
+    /// Which push connection is "current" for this session, bumped once per
+    /// register (fresh connect or reconnect) via [`begin_generation`](Self::begin_generation).
+    /// A connection's teardown ([`end_generation`](Self::end_generation)) only flips
+    /// `online` false if its own generation still matches — otherwise a reconnect has
+    /// already superseded it. Guards against a stale connection's delayed error/close
+    /// (e.g. a one-way network blackhole the outer proxy only reaps much later)
+    /// clobbering a newer, healthy connection's online state.
+    generation: AtomicU64,
     /// A tag identifying the pushed page config (CSS + fonts + render config),
     /// surfaced to viewers as a named `reload` SSE event. The hub sets it on every
     /// register (see [`set_reload_tag`](Self::set_reload_tag)); when a re-register
@@ -221,6 +230,7 @@ impl Live {
             writer: Mutex::new(()),
             diffs,
             online,
+            generation: AtomicU64::new(0),
             reload,
             #[cfg(any(feature = "serve-api", feature = "hub"))]
             closed,
@@ -324,6 +334,30 @@ impl Live {
     /// Whether the operator is currently online (the management API's `live` flag).
     pub fn is_online(&self) -> bool {
         *self.online.borrow()
+    }
+
+    /// Mark a new push connection as current for this session (a fresh register or a
+    /// reconnect), bringing the operator online, and return its generation number.
+    /// The caller holds onto it for the connection's lifetime and passes it to
+    /// [`end_generation`](Self::end_generation) when that connection's handler exits —
+    /// so a connection superseded by a later reconnect can tell its own teardown is
+    /// stale and must not flip `online` back off.
+    pub fn begin_generation(&self) -> u64 {
+        let next = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.online.send_replace(true);
+        next
+    }
+
+    /// A push connection's end of life: flip the operator offline, but only if `gen`
+    /// (from [`begin_generation`](Self::begin_generation)) is still the CURRENT
+    /// generation. If a reconnect has already called `begin_generation` again, this
+    /// connection's exit is a stale, delayed teardown (e.g. a one-way blackhole the
+    /// outer proxy took a while to reap) and must not clobber the newer connection's
+    /// online state.
+    pub fn end_generation(&self, generation: u64) {
+        if self.generation.load(Ordering::SeqCst) == generation {
+            self.online.send_replace(false);
+        }
     }
 
     /// Set the config tag broadcast to viewers as a `reload` event. The hub calls
