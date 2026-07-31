@@ -15,6 +15,10 @@
 //! is detected in seconds instead of the kernel's ~15-minute retransmission timeout.
 //! A clean shutdown (the hub's SIGTERM Close, or a network FIN) is detected at once.
 //! On any drop it reconnects with a fresh register + full.
+//!
+//! An outage only earns the visible cooked-mode pause + notice once it has
+//! outlived [`DOWN_GRACE`] — a hub bounced deliberately (stop, then start)
+//! reconnects well within that window, so the terminal is never disturbed.
 
 use crate::config::Config;
 use crate::diff;
@@ -51,6 +55,11 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const INITIAL_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 /// Backoff between reconnect attempts.
 const RECONNECT_BACKOFF: Duration = Duration::from_millis(500);
+/// How long an outage may run before it earns the visible pause+notice. A hub
+/// restart (e.g. its operator bouncing it deliberately) recovers well within
+/// this, so the terminal is never touched at all; only an outage that outlives
+/// it gets the cooked-mode clear + `shellglass: hub unreachable` notice.
+const DOWN_GRACE: Duration = Duration::from_secs(3);
 
 // ponytail: 8 positional args, one call site — an args struct would be ceremony
 // for no reader benefit. Bundle them if a second caller ever appears.
@@ -112,6 +121,9 @@ pub async fn run(
     // Whether we've reported the hub as down (so we report down/up once per outage,
     // not every retry).
     let mut down = false;
+    // When the current outage first became observable (a failed connect, or a
+    // session drop) — cleared on every successful connect. `None` while up.
+    let mut down_since: Option<std::time::Instant> = None;
     loop {
         let sink_status = backend.as_ref().map(|source| source.sink_status.as_ref());
         // Connect (and re-register) before streaming. The upgrade fails fast when the
@@ -124,6 +136,7 @@ pub async fn run(
                     report_up(sink_status);
                     down = false;
                 }
+                down_since = None;
                 ws
             }
             Err(ConnErr::Forbidden) => bail!(
@@ -136,7 +149,11 @@ pub async fn run(
             // it is control-char-free and length-bounded (see `incompat_message`).
             Err(ConnErr::Incompatible(msg)) => bail!("{msg}"),
             Err(ConnErr::Retry(cause)) => {
-                if !down {
+                let since = *down_since.get_or_insert_with(std::time::Instant::now);
+                // Only escalate to the visible pause once the outage has outlived
+                // DOWN_GRACE — a quick restart (e.g. `multiglass stop` immediately
+                // followed by `start`) never touches the terminal at all.
+                if !down && since.elapsed() >= DOWN_GRACE {
                     report_down(sink_status, cause);
                     down = true;
                 }
@@ -155,6 +172,7 @@ pub async fn run(
             End::Disconnected => {
                 // Transient — let the next connect decide if it's a real outage, so a
                 // quick reconnect doesn't flash a pause in the terminal.
+                down_since.get_or_insert_with(std::time::Instant::now);
                 tokio::time::sleep(RECONNECT_BACKOFF).await;
             }
         }
@@ -484,7 +502,7 @@ async fn send(ws: &mut WebSocket, msg: Message, timeout: Duration) -> Result<(),
 
 #[cfg(test)]
 mod tests {
-    use super::{Cause, SentBlobs, generic_incompat_message, incompat_message, notice};
+    use super::{Cause, SentBlobs, generic_incompat_message, incompat_message, notice, run};
 
     // The 426 message names which side is behind and echoes the hub's version —
     // neutered through `proto::neuter` (control-strip + length cap, tested there),
@@ -568,5 +586,168 @@ mod tests {
             s.contains(&format!("k{}", SentBlobs::CAP + 9)),
             "newest kept"
         );
+    }
+
+    #[tokio::test]
+    async fn quick_outage_stays_silent_but_one_past_grace_notifies() {
+        use crate::api::Presentation;
+        use crate::model::{Color, Frame, Grid, StyledCell};
+        use crate::source::{SinkStatus, SourceSession};
+        use axum::extract::ws::WebSocketUpgrade;
+        use axum::routing::get;
+        use std::sync::Arc;
+        use std::sync::Mutex as StdMutex;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        #[derive(Default)]
+        struct RecordingSink {
+            down: AtomicUsize,
+            up: AtomicUsize,
+        }
+        impl SinkStatus for RecordingSink {
+            fn hub_down(&self, _msg: &str) {
+                self.down.fetch_add(1, Ordering::SeqCst);
+            }
+            fn hub_up(&self) {
+                self.up.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        fn blank_frame() -> Frame {
+            Frame::Screen(Grid {
+                source_epoch: 0,
+                cols: 1,
+                rows: vec![vec![StyledCell {
+                    text: " ".into(),
+                    ..Default::default()
+                }]],
+                cursor: None,
+                cursor_style: 0,
+                default_colors: (Color::Default, Color::Default),
+                title: "grace-test".into(),
+                links: Default::default(),
+                images: Vec::new(),
+                image_data: Default::default(),
+            })
+        }
+
+        // One long-lived server, gated by a shared `up` flag: while up, every
+        // `/push` upgrade is accepted and counted, held open by polling `up`
+        // every 20ms and dropping the socket the moment it flips false; while
+        // down, a new upgrade is refused outright (503). Flipping `up` stands
+        // in for the hub bouncing (`multiglass stop`/`start`) without racing a
+        // real bind/unbind cycle on the port — the *client's* view (connection
+        // drops, then future connects fail) is what matters here, not the
+        // exact server-side mechanics of a real relay restart.
+        fn spawn_hub(
+            addr: std::net::SocketAddr,
+            conns: Arc<AtomicUsize>,
+            up: Arc<AtomicBool>,
+        ) -> tokio::task::JoinHandle<()> {
+            use axum::response::IntoResponse;
+            let app = axum::Router::new().route(
+                "/push",
+                get(move |upgrade: WebSocketUpgrade| {
+                    let conns = conns.clone();
+                    let up = up.clone();
+                    async move {
+                        if !up.load(Ordering::SeqCst) {
+                            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        upgrade
+                            .on_upgrade(move |mut socket| async move {
+                                conns.fetch_add(1, Ordering::SeqCst);
+                                loop {
+                                    tokio::select! {
+                                        msg = socket.recv() => match msg {
+                                            Some(Ok(_)) => {}
+                                            _ => break,
+                                        },
+                                        _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                                            if !up.load(Ordering::SeqCst) {
+                                                break; // gate flipped down: drop this socket
+                                            }
+                                        }
+                                    }
+                                }
+                            })
+                            .into_response()
+                    }
+                }),
+            );
+            tokio::spawn(async move {
+                let listener = tokio::net::TcpListener::bind(addr).await.expect("bind test hub");
+                let _ = axum::serve(listener, app).await;
+            })
+        }
+
+        async fn wait_for(deadline_secs: u64, what: &str, mut cond: impl FnMut() -> bool) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(deadline_secs);
+            while !cond() {
+                assert!(tokio::time::Instant::now() < deadline, "timed out waiting for {what}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = reservation.local_addr().unwrap();
+        drop(reservation);
+        let base = format!("http://{addr}");
+
+        let conns = Arc::new(AtomicUsize::new(0));
+        let up = Arc::new(AtomicBool::new(true));
+        let _hub = spawn_hub(addr, conns.clone(), up.clone());
+
+        let presentation = Presentation::load(None).unwrap();
+        let sink = Arc::new(RecordingSink::default());
+        let started = Arc::new(AtomicBool::new(false));
+        let (_frame_tx, frame_rx) = tokio::sync::watch::channel(Arc::new(blank_frame()));
+        let source = Arc::new(StdMutex::new(Some((frame_rx, sink.clone()))));
+
+        let run_task = tokio::spawn(run(
+            base.clone(),
+            "test-key".to_string(),
+            presentation.config.clone(),
+            presentation.resolver.clone(),
+            presentation.fonts.clone(),
+            presentation.template.clone(),
+            false,
+            {
+                let started = started.clone();
+                move || {
+                    started.store(true, Ordering::SeqCst);
+                    let (frame_rx, sink) = source.lock().unwrap().take().expect("started once");
+                    Ok(SourceSession::new(frame_rx, sink))
+                }
+            },
+        ));
+
+        wait_for(5, "initial connect", || conns.load(Ordering::SeqCst) >= 1).await;
+        assert!(started.load(Ordering::SeqCst), "backend started after first connect");
+
+        // Quick outage (< DOWN_GRACE): must never surface at all.
+        up.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(sink.down.load(Ordering::SeqCst), 0, "short outage must stay silent");
+        up.store(true, Ordering::SeqCst);
+        wait_for(5, "reconnect after short outage", || conns.load(Ordering::SeqCst) >= 2).await;
+        // Give the (silent) up-path a moment to run, then confirm it never fired.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(sink.down.load(Ordering::SeqCst), 0, "no down ⇒ no flash for a quick restart");
+        assert_eq!(sink.up.load(Ordering::SeqCst), 0, "no down ever reported ⇒ no up either");
+
+        // Long outage (> DOWN_GRACE): must notify exactly once, only after grace.
+        up.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(sink.down.load(Ordering::SeqCst), 0, "still within grace");
+        tokio::time::sleep(Duration::from_millis(2000)).await; // total ~3.5s > DOWN_GRACE (3s)
+        assert_eq!(sink.down.load(Ordering::SeqCst), 1, "outage past grace must notify once");
+        up.store(true, Ordering::SeqCst);
+        wait_for(5, "reconnect after long outage", || conns.load(Ordering::SeqCst) >= 3).await;
+        wait_for(2, "up notice after reconnect", || sink.up.load(Ordering::SeqCst) >= 1).await;
+        assert_eq!(sink.down.load(Ordering::SeqCst), 1, "still exactly one down notice");
+
+        run_task.abort();
     }
 }
