@@ -571,7 +571,7 @@ impl SourceArgs {
     }
 
     fn start(&self) -> Result<crate::source::SourceSession> {
-        pty::start(&self.command(), self.sixel_compat)
+        pty::start(&self.command(), self.sixel_compat, false)
     }
 }
 

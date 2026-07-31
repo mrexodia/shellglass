@@ -267,6 +267,14 @@ pub struct PushOptions {
     pub url: String,
     pub key: String,
     pub no_record: bool,
+    /// Start the source immediately instead of waiting for the hub to accept a
+    /// connection first — for an embedder where the source is the point
+    /// regardless of hub reachability (e.g. an interactive terminal that's
+    /// useful with or without anything watching it), rather than a producer
+    /// that only exists to be pushed. See [`crate::client::run`]. Off by
+    /// default: shellglass's own gate (don't take the terminal until the hub
+    /// accepts) still applies unless an embedder opts in.
+    pub eager_start: bool,
 }
 
 #[cfg(feature = "push-api")]
@@ -276,14 +284,16 @@ impl PushOptions {
             url: url.into(),
             key: key.into(),
             no_record: false,
+            eager_start: false,
         }
     }
 }
 
 /// Push any parser-independent source to an ordinary shellglass hub.
 ///
-/// The source factory is deliberately invoked only after the hub accepts the
-/// authenticated WebSocket upgrade.
+/// The source factory is invoked immediately when `options.eager_start` is
+/// set, otherwise only after the hub accepts the authenticated WebSocket
+/// upgrade (shellglass's own default).
 #[cfg(feature = "push-api")]
 pub async fn push<F>(start: F, presentation: Presentation, options: PushOptions) -> Result<()>
 where
@@ -297,6 +307,7 @@ where
         presentation.fonts,
         presentation.template,
         options.no_record,
+        options.eager_start,
         start,
     )
     .await
